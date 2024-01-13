@@ -1,5 +1,8 @@
+
 """
-VIX Calculation
+2019 VIX Whitepaper Replication
+Author: Andrew Rovinski, CFA
+Last Revision: 1/13/2024
 
 Assumptions in the white paper example:
 
@@ -13,9 +16,13 @@ Assumptions in the white paper example:
 - Near-term rate is 0.0305%
 - Next-term rate is 0.0286%
 
-In order to make this calculation extendable to real life, it is assumed that
-the current date (quote date) is 1/27/2020. This makes the near-term
-expiration date 2/21/2020, and the next-term expiration date 2/28/2020.
+NOTE: CMT yields are typically quoted on a semi-annual, bond-equivalent-yield
+basis, while the calculations require conversions to continuously compounded
+rates. In
+
+For replication purposes, it is assumed that the current date (quote date)
+is 1/27/2020. This makes the near-term expiration date 2/21/2020,
+and the next-term expiration date 2/28/2020.
 
 """
 
@@ -87,9 +94,18 @@ def granular_forwards(forward_df, yield_df, quote_date):
     forward_df['mte'] = forward_df['mte'] / pd.Timedelta('1 minute')
 
     ###########################################################################
-    # Manual fix to validate against white paper
-    # forward_df.loc[forward_df.index[0], 'mte'] = 854 + 510 + 34560
-    # forward_df.loc[forward_df.index[1], 'mte'] = 854 + 900 + 44640
+    # NOTE: Manual fix to validate against white paper.
+    #
+    # The VIX 2019 whitepaper incorrectly uses CT minutes to midnight
+    # instead of ET minutes to midnight (ET times were indicated in the paper).
+    # Using the "correct" ET calculations, minutes to expiry would be off by
+    # 1 hour, and would not tie to the VIX value in the whitepaper.
+    #
+    # The lines below can be commented out in order to extend these
+    # calculations to use updated/real-time data.
+    #
+    forward_df.loc[forward_df.index[0], 'mte'] = 854 + 510 + 34560
+    forward_df.loc[forward_df.index[1], 'mte'] = 854 + 900 + 44640
     ###########################################################################
 
     # Calculate the years to expiry
@@ -102,9 +118,18 @@ def granular_forwards(forward_df, yield_df, quote_date):
     forward_df['rfr'] = forward_df['ttm'].apply(interp)
 
     ###########################################################################
-    # Manual fix to validate against white paper
-    # forward_df.loc[forward_df.index[0], 'rfr'] = 0.000305
-    # forward_df.loc[forward_df.index[1], 'rfr'] = 0.000286
+    # NOTE: Manual fix to validate against white paper.
+    #
+    # As only two continuously compounded yield values were given in the
+    # whitepaper, and a cubic spline interpolation was indicated in the
+    # whitepaper for actual (non-reproduction) calculations, these values are
+    # explicitly set to tie to the whitepaper.
+    #
+    # The lines below can be commented out in order to extend these
+    # calculations to use updated/real-time data.
+    #
+    forward_df.loc[forward_df.index[0], 'rfr'] = 0.000305
+    forward_df.loc[forward_df.index[1], 'rfr'] = 0.000286
     ###########################################################################
 
     # Calculate the implied forward
@@ -232,15 +257,17 @@ def group_average_atmf(group):
     :return: pd.DataFrame group object
     """
 
-    aggs = {'strike': pd.Series.unique,
-            'expiration': pd.Series.unique,
+    aggs = {'strike': 'unique',
+            'expiration': 'unique',
             'bid': 'mean',
             'ask': 'mean',
-            'expiration_type': pd.Series.unique,
+            'expiration_type': 'unique',
             'option_type': lambda x: ''.join(x.unique()),
             'mid': 'mean'}
 
     dub_group = group.groupby('strike').agg(aggs)
+
+    dub_group = dub_group.explode(['strike', 'expiration', 'expiration_type'])
 
     return dub_group
 
@@ -374,6 +401,41 @@ def interpolate_vix(sigma_squared, forward_df, target_days):
     return vix
 
 
+def convert_yields_to_continuous(yield_df):
+    """
+    Calculates continuous yields from quoted CMT yields.
+
+    CMT quoted yields are assumed to use a semi-annual "bond-equivalent yield"
+    convention. Therefore, a transformation of the form:
+
+        continuously compounded yield = 2 * ln[(1 + y / 2)]
+
+    is used to calculate the continuous yields.
+
+    :param yield_df: pd.DataFrame with "expiration" and "yield" columns
+    :return: pd.DataFrame with "expiration", "yield", and "yield_cont" columns
+    """
+
+    yield_df['yield_cont'] = 2 * np.log((1 + yield_df['yield'] / 2))
+
+    return yield_df
+
+
+def calculate_years_to_maturity(yield_df, quote_date):
+    """
+    Calculates the years to maturity fraction based on the bond maturity date
+    and the quote date.
+
+    :param yield_df: pd.DataFrame of the bond maturities
+    :return: pd.Dataframe with the years to maturity
+    """
+
+    yield_df['ttm'] = (
+            (yield_df['maturity'] - quote_date) / pd.Timedelta('365D'))
+
+    return yield_df
+
+
 def calculate_vix(quote_date, yield_df, option_df, target_days=30):
     """
     Main entry point/wrapper function for the VIX calculation.
@@ -381,10 +443,10 @@ def calculate_vix(quote_date, yield_df, option_df, target_days=30):
     NOTE: The data for yields and options should look similar to below.
 
     ttm,yield
-    0.0821,0.0153
-    0.1666,0.0155
-    0.2500,0.0154
-    0.5000,0.0156
+    2/1/2020,0.000305023
+    2/21/2020,0.000305023
+    2/28/2020,0.00028602
+    3/1/2020,0.00028602
 
     expiration,strike,option_type,bid,ask,expiration_type
     2-21-2020,3000,PUT,3.50,3.70,standard
@@ -405,20 +467,29 @@ def calculate_vix(quote_date, yield_df, option_df, target_days=30):
     :return: float of the VIX value
     """
 
+    yield_df = convert_yields_to_continuous(yield_df)
+    yield_df = calculate_years_to_maturity(yield_df, quote_date)
+
     options = map_exact_expiration(option_df)
     options = calculate_mid(options)
+
     forwards = rough_forwards(options)
     forwards = granular_forwards(forwards, yield_df, quote_date)
     forwards = find_k_zero(options, forwards)
+
     options = filter_itm(options, forwards)
     options = filter_tails(options)
     options = filter_zeroes(options)
     options = atmf_average(options)
     options = delta_k(options)
     options = strike_contributions(options, forwards)
+
     t_var = total_variance(options)
+
     fwd_adj = variance_adj(forwards)
+
     sigma_squared = t_var - fwd_adj
+
     vix = interpolate_vix(sigma_squared, forwards, target_days)
 
     return vix
@@ -426,17 +497,15 @@ def calculate_vix(quote_date, yield_df, option_df, target_days=30):
 
 if __name__ == '__main__':
 
-    # Set the date for the VIX quote (a reasonable assumption would be 'now')
+    # Set the date for the VIX quote
     quote_date = pd.Timestamp('1-27-2020 09:46:00')
 
     # Get interest rate data
     yields = pd.read_csv('wp_yields.csv')
     yields['maturity'] = pd.to_datetime(yields['maturity'])
-    # Convert yield tenors to years for use with the interpolator
-    yields['ttm'] = (yields['maturity'] - quote_date) / pd.Timedelta('1Y')
 
     # Get the option chain quotes
-    options = pd.read_csv('wp_data.csv')
+    options = pd.read_csv('wp_options_data.csv')
     options['expiration'] = pd.to_datetime(options['expiration'])
 
     # Run the calculation
